@@ -6160,6 +6160,216 @@ Java_ksqlite_foreign_KsqliteJni_sqlite3_1value_1type(
     return sqlite3_value_type(LongTo_s3_value(value));
 }
 
+///////////////////////////////////////////////////////////////////////////
+// VFS Shim
+///////////////////////////////////////////////////////////////////////////
+
+// The shim itself (forwarding, file layout, event gating) is `ksqlite_vfs_shim_*` in ksqlite.c.
+// This side only routes its events to a Java `VfsShimCallbacks` object: the shim's pAppData is a
+// VfsShimJniState, and each file's data slot a global ref to the object `onOpen` returned for it.
+
+/**
+ * A VFS shim's pAppData.
+ */
+struct VfsShimJniState {
+    jobject callbacks; // global ref to a `VfsShimCallbacks`
+    jmethodID onOpen;
+    jmethodID onEvent;
+    jmethodID onClose;
+};
+
+/**
+ * Clears any Java exception left pending by a callback: SQLite must never keep running with one
+ * pending. `VfsShimCallbacks` implementations handle their own exceptions, so this is a backstop.
+ */
+static void vfsShimClearException(JNIEnv* env) {
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
+}
+
+static void vfsShimEvent(
+    void* pAppData,
+    sqlite3_file* pFile,
+    int event,
+    sqlite3_int64 a,
+    sqlite3_int64 b,
+    sqlite3_int64 c,
+    const char* z1,
+    const char* z2,
+    int rc
+) {
+    const auto pState = static_cast<VfsShimJniState*>(pAppData);
+    JniEnvDeclare();
+
+    if (event == KSQLITE_VFS_SHIM_EVENT_OPEN) {
+        const auto filename = z1 == nullptr ? nullptr : Utf8ToJstring(z1);
+
+        const auto file = env->CallObjectMethod(
+            pState->callbacks,
+            pState->onOpen,
+            PtrToLong(pFile),
+            filename,
+            static_cast<jint>(a)
+        );
+
+        vfsShimClearException(env);
+        LocalRefDestroy(filename);
+
+        if (file != nullptr) {
+            ksqlite_vfs_shim_file_set_data(pFile, GlobalRefCreate(file));
+
+            env->CallVoidMethod(pState->callbacks, pState->onEvent, file, event, a, b, c, nullptr, nullptr, rc);
+            vfsShimClearException(env);
+            LocalRefDestroy(file);
+        }
+
+        return;
+    }
+
+    const auto file = pFile == nullptr
+        ? nullptr
+        : static_cast<jobject>(ksqlite_vfs_shim_file_data(pFile));
+
+    if (event == KSQLITE_VFS_SHIM_EVENT_CLOSE) {
+        if (file != nullptr) {
+            env->CallVoidMethod(pState->callbacks, pState->onClose, file, a != 0, rc);
+            vfsShimClearException(env);
+            ksqlite_vfs_shim_file_set_data(pFile, nullptr);
+            GlobalRefDestroy(file);
+        }
+
+        return;
+    }
+
+    // Only VFS events carry strings, so file events (the hot path) allocate none.
+    const auto s1 = z1 == nullptr ? nullptr : Utf8ToJstring(z1);
+    const auto s2 = z2 == nullptr ? nullptr : Utf8ToJstring(z2);
+
+    env->CallVoidMethod(pState->callbacks, pState->onEvent, file, event, a, b, c, s1, s2, rc);
+    vfsShimClearException(env);
+
+    LocalRefDestroy(s1);
+    LocalRefDestroy(s2);
+}
+
+extern "C"
+JNIEXPORT jlong JNICALL
+Java_ksqlite_foreign_KsqliteJni_nativeVfsShimRegister(
+    JNIEnv* env,
+    jclass clazz,
+    jstring name,
+    jstring underlyingVfsName,
+    jint listenedEvents,
+    jint initialFileEvents,
+    jobject callbacks
+) {
+    const auto pState = new VfsShimJniState();
+    pState->callbacks = GlobalRefCreate(callbacks);
+
+    const auto klass = env->GetObjectClass(callbacks);
+
+    pState->onOpen = RequireKsqliteClassMethod(
+        klass,
+        "onOpen",
+        "(JLjava/lang/String;I)Ljava/lang/Object;",
+        "callbacks/VfsShimCallbacks"
+    );
+
+    pState->onEvent = RequireKsqliteClassMethod(
+        klass,
+        "onEvent",
+        "(Ljava/lang/Object;IJJJLjava/lang/String;Ljava/lang/String;I)V",
+        "callbacks/VfsShimCallbacks"
+    );
+
+    pState->onClose = RequireKsqliteClassMethod(
+        klass,
+        "onClose",
+        "(Ljava/lang/Object;ZI)V",
+        "callbacks/VfsShimCallbacks"
+    );
+
+    LocalRefDestroy(klass);
+
+    const auto zName = JstringToUtf8(name);
+    const auto zUnderlying = underlyingVfsName == nullptr ? nullptr : JstringToUtf8(underlyingVfsName);
+    sqlite3_vfs* pVfs = nullptr;
+
+    const auto rc = ksqlite_vfs_shim_register(
+        zName,
+        zUnderlying,
+        static_cast<unsigned int>(listenedEvents),
+        static_cast<unsigned int>(initialFileEvents),
+        vfsShimEvent,
+        pState,
+        &pVfs
+    );
+
+    sqlite3_free(zName);
+    sqlite3_free(zUnderlying);
+
+    if (rc != SQLITE_OK) {
+        GlobalRefDestroy(pState->callbacks);
+        delete pState;
+        return 0;
+    }
+
+    return PtrToLong(pVfs);
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_ksqlite_foreign_KsqliteJni_nativeVfsShimUnregister(
+    JNIEnv* env,
+    jclass clazz,
+    jlong vfs
+) {
+    const auto pVfs = LongTo_s3_vfs(vfs);
+    const auto pState = static_cast<VfsShimJniState*>(ksqlite_vfs_shim_app_data(pVfs));
+    const auto rc = ksqlite_vfs_shim_unregister(pVfs);
+
+    if (rc == SQLITE_OK && pState != nullptr) {
+        GlobalRefDestroy(pState->callbacks);
+        delete pState;
+    }
+
+    return rc;
+}
+
+extern "C"
+JNIEXPORT jobject JNICALL
+Java_ksqlite_foreign_KsqliteJni_nativeVfsShimFileLookup(
+    JNIEnv* env,
+    jclass clazz,
+    jlong vfs,
+    jlong db,
+    jstring schema,
+    jboolean journal
+) {
+    const auto zSchema = JstringToUtf8(schema);
+    const auto pFile = ksqlite_vfs_shim_file_lookup(LongTo_s3_vfs(vfs), LongTo_s3(db), zSchema, journal);
+    sqlite3_free(zSchema);
+
+    if (pFile == nullptr) {
+        return nullptr;
+    }
+
+    return LocalRefCreate(static_cast<jobject>(ksqlite_vfs_shim_file_data(pFile)));
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_ksqlite_foreign_KsqliteJni_nativeVfsShimFileSetEvents(
+    JNIEnv* env,
+    jclass clazz,
+    jlong file,
+    jint events
+) {
+    ksqlite_vfs_shim_file_set_events(LongCast(sqlite3_file*, file), static_cast<unsigned int>(events));
+}
+
 extern "C"
 JNIEXPORT jlong JNICALL
 Java_ksqlite_foreign_KsqliteJni_sqlite3_1vfs_1find(

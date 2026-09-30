@@ -70,6 +70,41 @@ public external interface Sqlite3WasmExports : JsAny {
 
     public fun ksqlite_struct_layout_free(p0: JsBigInt)
 
+    public fun ksqlite_vfs_shim_register(
+        p0: JsBigInt,
+        p1: JsBigInt,
+        p2: Int,
+        p3: Int,
+        p4: JsBigInt,
+        p5: JsBigInt,
+        p6: JsBigInt,
+    ): Int
+
+    public fun ksqlite_vfs_shim_unregister(p0: JsBigInt): Int
+
+    public fun ksqlite_vfs_shim_app_data(p0: JsBigInt): JsBigInt
+
+    public fun ksqlite_vfs_shim_file_data(p0: JsBigInt): JsBigInt
+
+    public fun ksqlite_vfs_shim_file_set_data(
+        p0: JsBigInt,
+        p1: JsBigInt,
+    )
+
+    public fun ksqlite_vfs_shim_file_events(p0: JsBigInt): Int
+
+    public fun ksqlite_vfs_shim_file_set_events(
+        p0: JsBigInt,
+        p1: Int,
+    )
+
+    public fun ksqlite_vfs_shim_file_lookup(
+        p0: JsBigInt,
+        p1: JsBigInt,
+        p2: JsBigInt,
+        p3: Int,
+    ): JsBigInt
+
     ///////////////////////////////////////////////////////////////////////////
     // SQLite
     ///////////////////////////////////////////////////////////////////////////

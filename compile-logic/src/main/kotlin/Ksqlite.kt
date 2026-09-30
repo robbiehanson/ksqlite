@@ -47,6 +47,7 @@ val KsqliteTypedefs = listOf(
     "xLog",
     "xSqllog",
     "xEntryPoint",
+    "xVfsShimEvent",
     "cipher_descriptor",
     "cipher_params"
 ).ksqlitePrefixed()
@@ -64,7 +65,15 @@ val KsqliteFunctions = listOf(
     "prepare_v2",
     "prepare_v3",
     "struct_layout_allocate",
-    "struct_layout_free"
+    "struct_layout_free",
+    "vfs_shim_register",
+    "vfs_shim_unregister",
+    "vfs_shim_app_data",
+    "vfs_shim_file_data",
+    "vfs_shim_file_set_data",
+    "vfs_shim_file_events",
+    "vfs_shim_file_set_events",
+    "vfs_shim_file_lookup"
 ).ksqlitePrefixed()
 
 ///////////////////////////////////////////////////////////////////////////

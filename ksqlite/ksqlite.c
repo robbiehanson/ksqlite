@@ -19,6 +19,8 @@
 
 #endif
 
+#include <string.h>
+
 ///////////////////////////////////////////////////////////////////////////
 // Constants
 ///////////////////////////////////////////////////////////////////////////
@@ -341,6 +343,651 @@ int ksqlite_prepare_v3(
     }
 
     return rc;
+}
+
+///////////////////////////////////////////////////////////////////////////
+// VFS shim
+///////////////////////////////////////////////////////////////////////////
+
+// A VFS shim is the classic SQLite "shim" technique (see SQLite's own test_vfstrace.c): a thin
+// VFS forwarding every call to an underlying VFS, here reporting each call to a single event
+// handler afterwards. Names are prefixed throughout, since the Wasm build compiles this file into
+// the same translation unit as SQLite's own amalgamation.
+
+/**
+ * A registered shim. `base` must stay first: SQLite hands the shim's methods a `sqlite3_vfs*`.
+ * The shim's name is stored right after this struct, in the same allocation.
+ */
+typedef struct KsqliteVfsShim {
+    sqlite3_vfs base;
+    sqlite3_vfs* pReal;
+    unsigned int listenedEvents;
+    unsigned int initialFileEvents;
+    ksqlite_xVfsShimEvent xEvent;
+    void* pAppData;
+} KsqliteVfsShim;
+
+/**
+ * The shim's own part of each file it opens, followed (at KSQLITE_VFS_SHIM_FILE_HEADER_SIZE) by
+ * the underlying VFS's own file. `base` must stay first. `base.pMethods` points at `methods`
+ * while the file is open, so the shim needs no per-file allocation of its own.
+ */
+typedef struct KsqliteVfsShimFile {
+    sqlite3_file base;
+    sqlite3_io_methods methods;
+    KsqliteVfsShim* pShim;
+    void* pData;
+    unsigned int events;
+} KsqliteVfsShimFile;
+
+// Rounded up to 8 so the underlying file stays suitably aligned on 32-bit targets too.
+#define KSQLITE_VFS_SHIM_FILE_HEADER_SIZE ((int) ((sizeof(KsqliteVfsShimFile) + 7) & ~((size_t) 7)))
+
+#define KsqliteVfsShimRealFile(p) \
+    ((sqlite3_file*) (((char*) (p)) + KSQLITE_VFS_SHIM_FILE_HEADER_SIZE))
+
+#define KsqliteVfsShimBit(event) (1u << (event))
+
+// Whether a file event other than OPEN/CLOSE is both listened to and enabled on the file.
+#define KsqliteVfsShimFileWants(p, event) \
+    (((p)->pShim->listenedEvents & (p)->events & KsqliteVfsShimBit(event)) != 0)
+
+#define KsqliteVfsShimNotifyFile(p, event, a, b, c, rc) \
+    (p)->pShim->xEvent((p)->pShim->pAppData, &(p)->base, (event), (a), (b), (c), 0, 0, (rc))
+
+#define KsqliteVfsShimVfsWants(pShim, event) \
+    (((pShim)->listenedEvents & KsqliteVfsShimBit(event)) != 0)
+
+// Success by primary result code: VFSes can return extended "OK" codes, e.g. xFullPathname's
+// SQLITE_OK_SYMLINK.
+#define KsqliteVfsShimIsOk(rc) (((rc) & 0xff) == SQLITE_OK)
+
+#define KsqliteVfsShimOf(pVfs) ((KsqliteVfsShim*) (pVfs))
+
+#define KsqliteVfsShimFileOf(pFile) ((KsqliteVfsShimFile*) (pFile))
+
+// sqlite3_io_methods
+
+static int ksqlite_vfs_shim_io_close(sqlite3_file* pFile) {
+    KsqliteVfsShimFile* p = KsqliteVfsShimFileOf(pFile);
+    sqlite3_file* pReal = KsqliteVfsShimRealFile(p);
+    int rc = pReal->pMethods->xClose(pReal);
+
+    // SQLite ignores xClose's result and never retries a close (see sqlite3OsClose), so the file's
+    // lifecycle ends here regardless of rc - and the handler is always told, so it can release
+    // whatever it attached.
+    p->pShim->xEvent(
+        p->pShim->pAppData,
+        pFile,
+        KSQLITE_VFS_SHIM_EVENT_CLOSE,
+        KsqliteVfsShimFileWants(p, KSQLITE_VFS_SHIM_EVENT_CLOSE) ? 1 : 0,
+        0,
+        0,
+        0,
+        0,
+        rc
+    );
+
+    p->pData = 0;
+    p->events = 0;
+    return rc;
+}
+
+static int ksqlite_vfs_shim_io_read(sqlite3_file* pFile, void* zBuf, int iAmt, sqlite3_int64 iOfst) {
+    KsqliteVfsShimFile* p = KsqliteVfsShimFileOf(pFile);
+    sqlite3_file* pReal = KsqliteVfsShimRealFile(p);
+    int rc = pReal->pMethods->xRead(pReal, zBuf, iAmt, iOfst);
+
+    if (KsqliteVfsShimFileWants(p, KSQLITE_VFS_SHIM_EVENT_READ)) {
+        KsqliteVfsShimNotifyFile(p, KSQLITE_VFS_SHIM_EVENT_READ, iAmt, iOfst, 0, rc);
+    }
+
+    return rc;
+}
+
+static int ksqlite_vfs_shim_io_write(
+    sqlite3_file* pFile,
+    const void* zBuf,
+    int iAmt,
+    sqlite3_int64 iOfst
+) {
+    KsqliteVfsShimFile* p = KsqliteVfsShimFileOf(pFile);
+    sqlite3_file* pReal = KsqliteVfsShimRealFile(p);
+    int rc = pReal->pMethods->xWrite(pReal, zBuf, iAmt, iOfst);
+
+    if (KsqliteVfsShimFileWants(p, KSQLITE_VFS_SHIM_EVENT_WRITE)) {
+        KsqliteVfsShimNotifyFile(p, KSQLITE_VFS_SHIM_EVENT_WRITE, iAmt, iOfst, 0, rc);
+    }
+
+    return rc;
+}
+
+static int ksqlite_vfs_shim_io_truncate(sqlite3_file* pFile, sqlite3_int64 size) {
+    KsqliteVfsShimFile* p = KsqliteVfsShimFileOf(pFile);
+    sqlite3_file* pReal = KsqliteVfsShimRealFile(p);
+    int rc = pReal->pMethods->xTruncate(pReal, size);
+
+    if (KsqliteVfsShimFileWants(p, KSQLITE_VFS_SHIM_EVENT_TRUNCATE)) {
+        KsqliteVfsShimNotifyFile(p, KSQLITE_VFS_SHIM_EVENT_TRUNCATE, size, 0, 0, rc);
+    }
+
+    return rc;
+}
+
+static int ksqlite_vfs_shim_io_sync(sqlite3_file* pFile, int flags) {
+    KsqliteVfsShimFile* p = KsqliteVfsShimFileOf(pFile);
+    sqlite3_file* pReal = KsqliteVfsShimRealFile(p);
+    int rc = pReal->pMethods->xSync(pReal, flags);
+
+    if (KsqliteVfsShimFileWants(p, KSQLITE_VFS_SHIM_EVENT_SYNC)) {
+        KsqliteVfsShimNotifyFile(p, KSQLITE_VFS_SHIM_EVENT_SYNC, flags, 0, 0, rc);
+    }
+
+    return rc;
+}
+
+static int ksqlite_vfs_shim_io_file_size(sqlite3_file* pFile, sqlite3_int64* pSize) {
+    KsqliteVfsShimFile* p = KsqliteVfsShimFileOf(pFile);
+    sqlite3_file* pReal = KsqliteVfsShimRealFile(p);
+    int rc = pReal->pMethods->xFileSize(pReal, pSize);
+
+    if (KsqliteVfsShimFileWants(p, KSQLITE_VFS_SHIM_EVENT_FILE_SIZE)) {
+        KsqliteVfsShimNotifyFile(
+            p, KSQLITE_VFS_SHIM_EVENT_FILE_SIZE, KsqliteVfsShimIsOk(rc) ? *pSize : 0, 0, 0, rc
+        );
+    }
+
+    return rc;
+}
+
+static int ksqlite_vfs_shim_io_lock(sqlite3_file* pFile, int eLock) {
+    KsqliteVfsShimFile* p = KsqliteVfsShimFileOf(pFile);
+    sqlite3_file* pReal = KsqliteVfsShimRealFile(p);
+    int rc = pReal->pMethods->xLock(pReal, eLock);
+
+    if (KsqliteVfsShimFileWants(p, KSQLITE_VFS_SHIM_EVENT_LOCK)) {
+        KsqliteVfsShimNotifyFile(p, KSQLITE_VFS_SHIM_EVENT_LOCK, eLock, 0, 0, rc);
+    }
+
+    return rc;
+}
+
+static int ksqlite_vfs_shim_io_unlock(sqlite3_file* pFile, int eLock) {
+    KsqliteVfsShimFile* p = KsqliteVfsShimFileOf(pFile);
+    sqlite3_file* pReal = KsqliteVfsShimRealFile(p);
+    int rc = pReal->pMethods->xUnlock(pReal, eLock);
+
+    if (KsqliteVfsShimFileWants(p, KSQLITE_VFS_SHIM_EVENT_UNLOCK)) {
+        KsqliteVfsShimNotifyFile(p, KSQLITE_VFS_SHIM_EVENT_UNLOCK, eLock, 0, 0, rc);
+    }
+
+    return rc;
+}
+
+static int ksqlite_vfs_shim_io_check_reserved_lock(sqlite3_file* pFile, int* pResOut) {
+    KsqliteVfsShimFile* p = KsqliteVfsShimFileOf(pFile);
+    sqlite3_file* pReal = KsqliteVfsShimRealFile(p);
+    int rc = pReal->pMethods->xCheckReservedLock(pReal, pResOut);
+
+    if (KsqliteVfsShimFileWants(p, KSQLITE_VFS_SHIM_EVENT_CHECK_RESERVED_LOCK)) {
+        KsqliteVfsShimNotifyFile(
+            p,
+            KSQLITE_VFS_SHIM_EVENT_CHECK_RESERVED_LOCK,
+            KsqliteVfsShimIsOk(rc) ? *pResOut : 0,
+            0,
+            0,
+            rc
+        );
+    }
+
+    return rc;
+}
+
+static int ksqlite_vfs_shim_io_file_control(sqlite3_file* pFile, int op, void* pArg) {
+    KsqliteVfsShimFile* p = KsqliteVfsShimFileOf(pFile);
+    sqlite3_file* pReal = KsqliteVfsShimRealFile(p);
+    int rc = pReal->pMethods->xFileControl(pReal, op, pArg);
+
+    if (KsqliteVfsShimFileWants(p, KSQLITE_VFS_SHIM_EVENT_FILE_CONTROL)) {
+        KsqliteVfsShimNotifyFile(p, KSQLITE_VFS_SHIM_EVENT_FILE_CONTROL, op, 0, 0, rc);
+    }
+
+    return rc;
+}
+
+static int ksqlite_vfs_shim_io_sector_size(sqlite3_file* pFile) {
+    sqlite3_file* pReal = KsqliteVfsShimRealFile(pFile);
+    return pReal->pMethods->xSectorSize(pReal);
+}
+
+static int ksqlite_vfs_shim_io_device_characteristics(sqlite3_file* pFile) {
+    sqlite3_file* pReal = KsqliteVfsShimRealFile(pFile);
+    return pReal->pMethods->xDeviceCharacteristics(pReal);
+}
+
+static int ksqlite_vfs_shim_io_shm_map(
+    sqlite3_file* pFile,
+    int iPg,
+    int pgsz,
+    int isWrite,
+    void volatile** pp
+) {
+    KsqliteVfsShimFile* p = KsqliteVfsShimFileOf(pFile);
+    sqlite3_file* pReal = KsqliteVfsShimRealFile(p);
+    int rc = pReal->pMethods->xShmMap(pReal, iPg, pgsz, isWrite, pp);
+
+    if (KsqliteVfsShimFileWants(p, KSQLITE_VFS_SHIM_EVENT_SHM_MAP)) {
+        KsqliteVfsShimNotifyFile(p, KSQLITE_VFS_SHIM_EVENT_SHM_MAP, iPg, pgsz, isWrite, rc);
+    }
+
+    return rc;
+}
+
+static int ksqlite_vfs_shim_io_shm_lock(sqlite3_file* pFile, int offset, int n, int flags) {
+    KsqliteVfsShimFile* p = KsqliteVfsShimFileOf(pFile);
+    sqlite3_file* pReal = KsqliteVfsShimRealFile(p);
+    int rc = pReal->pMethods->xShmLock(pReal, offset, n, flags);
+
+    if (KsqliteVfsShimFileWants(p, KSQLITE_VFS_SHIM_EVENT_SHM_LOCK)) {
+        KsqliteVfsShimNotifyFile(p, KSQLITE_VFS_SHIM_EVENT_SHM_LOCK, offset, n, flags, rc);
+    }
+
+    return rc;
+}
+
+static void ksqlite_vfs_shim_io_shm_barrier(sqlite3_file* pFile) {
+    KsqliteVfsShimFile* p = KsqliteVfsShimFileOf(pFile);
+    sqlite3_file* pReal = KsqliteVfsShimRealFile(p);
+    pReal->pMethods->xShmBarrier(pReal);
+
+    if (KsqliteVfsShimFileWants(p, KSQLITE_VFS_SHIM_EVENT_SHM_BARRIER)) {
+        KsqliteVfsShimNotifyFile(p, KSQLITE_VFS_SHIM_EVENT_SHM_BARRIER, 0, 0, 0, SQLITE_OK);
+    }
+}
+
+static int ksqlite_vfs_shim_io_shm_unmap(sqlite3_file* pFile, int deleteFlag) {
+    KsqliteVfsShimFile* p = KsqliteVfsShimFileOf(pFile);
+    sqlite3_file* pReal = KsqliteVfsShimRealFile(p);
+    int rc = pReal->pMethods->xShmUnmap(pReal, deleteFlag);
+
+    if (KsqliteVfsShimFileWants(p, KSQLITE_VFS_SHIM_EVENT_SHM_UNMAP)) {
+        KsqliteVfsShimNotifyFile(p, KSQLITE_VFS_SHIM_EVENT_SHM_UNMAP, deleteFlag, 0, 0, rc);
+    }
+
+    return rc;
+}
+
+static int ksqlite_vfs_shim_io_fetch(
+    sqlite3_file* pFile,
+    sqlite3_int64 iOfst,
+    int iAmt,
+    void** pp
+) {
+    KsqliteVfsShimFile* p = KsqliteVfsShimFileOf(pFile);
+    sqlite3_file* pReal = KsqliteVfsShimRealFile(p);
+    int rc = pReal->pMethods->xFetch(pReal, iOfst, iAmt, pp);
+
+    if (KsqliteVfsShimFileWants(p, KSQLITE_VFS_SHIM_EVENT_FETCH)) {
+        KsqliteVfsShimNotifyFile(
+            p,
+            KSQLITE_VFS_SHIM_EVENT_FETCH,
+            iAmt,
+            iOfst,
+            KsqliteVfsShimIsOk(rc) && *pp != 0 ? 1 : 0,
+            rc
+        );
+    }
+
+    return rc;
+}
+
+static int ksqlite_vfs_shim_io_unfetch(sqlite3_file* pFile, sqlite3_int64 iOfst, void* pPage) {
+    KsqliteVfsShimFile* p = KsqliteVfsShimFileOf(pFile);
+    sqlite3_file* pReal = KsqliteVfsShimRealFile(p);
+    int rc = pReal->pMethods->xUnfetch(pReal, iOfst, pPage);
+
+    if (KsqliteVfsShimFileWants(p, KSQLITE_VFS_SHIM_EVENT_UNFETCH)) {
+        KsqliteVfsShimNotifyFile(p, KSQLITE_VFS_SHIM_EVENT_UNFETCH, iOfst, pPage != 0, 0, rc);
+    }
+
+    return rc;
+}
+
+// sqlite3_vfs
+
+static int ksqlite_vfs_shim_open(
+    sqlite3_vfs* pVfs,
+    sqlite3_filename zName,
+    sqlite3_file* pFile,
+    int flags,
+    int* pOutFlags
+) {
+    KsqliteVfsShim* pShim = KsqliteVfsShimOf(pVfs);
+    KsqliteVfsShimFile* p = KsqliteVfsShimFileOf(pFile);
+    sqlite3_file* pReal = KsqliteVfsShimRealFile(p);
+    const sqlite3_io_methods* pRealMethods;
+    int rc;
+
+    // SQLite doesn't zero the allocation, and a failed open must leave pMethods NULL.
+    memset(p, 0, sizeof(KsqliteVfsShimFile));
+
+    rc = pShim->pReal->xOpen(pShim->pReal, zName, pReal, flags, pOutFlags);
+    pRealMethods = pReal->pMethods;
+
+    if (pRealMethods == 0) {
+        return rc;
+    }
+
+    // A failed open must leave pMethods NULL (see sqlite3OsOpen), so SQLite never calls xClose on
+    // it. If the underlying xOpen failed after opening its file anyway (as the xOpen contract
+    // permits), close it here instead.
+    if (rc != SQLITE_OK) {
+        pRealMethods->xClose(pReal);
+        return rc;
+    }
+
+    p->methods.iVersion = pRealMethods->iVersion;
+    p->methods.xClose = ksqlite_vfs_shim_io_close;
+    p->methods.xRead = ksqlite_vfs_shim_io_read;
+    p->methods.xWrite = ksqlite_vfs_shim_io_write;
+    p->methods.xTruncate = ksqlite_vfs_shim_io_truncate;
+    p->methods.xSync = ksqlite_vfs_shim_io_sync;
+    p->methods.xFileSize = ksqlite_vfs_shim_io_file_size;
+    p->methods.xLock = ksqlite_vfs_shim_io_lock;
+    p->methods.xUnlock = ksqlite_vfs_shim_io_unlock;
+    p->methods.xCheckReservedLock = ksqlite_vfs_shim_io_check_reserved_lock;
+    p->methods.xFileControl = ksqlite_vfs_shim_io_file_control;
+    p->methods.xSectorSize = ksqlite_vfs_shim_io_sector_size;
+    p->methods.xDeviceCharacteristics = ksqlite_vfs_shim_io_device_characteristics;
+
+    if (pRealMethods->iVersion >= 2) {
+        p->methods.xShmMap = pRealMethods->xShmMap ? ksqlite_vfs_shim_io_shm_map : 0;
+        p->methods.xShmLock = pRealMethods->xShmLock ? ksqlite_vfs_shim_io_shm_lock : 0;
+        p->methods.xShmBarrier = pRealMethods->xShmBarrier ? ksqlite_vfs_shim_io_shm_barrier : 0;
+        p->methods.xShmUnmap = pRealMethods->xShmUnmap ? ksqlite_vfs_shim_io_shm_unmap : 0;
+    }
+
+    if (pRealMethods->iVersion >= 3) {
+        p->methods.xFetch = pRealMethods->xFetch ? ksqlite_vfs_shim_io_fetch : 0;
+        p->methods.xUnfetch = pRealMethods->xUnfetch ? ksqlite_vfs_shim_io_unfetch : 0;
+    }
+
+    p->pShim = pShim;
+    p->events = pShim->initialFileEvents;
+    p->base.pMethods = &p->methods;
+
+    // Always reported: the handler attaches its own per-file state here. The initial events are
+    // already applied, so the handler can adjust them for this particular file.
+    pShim->xEvent(
+        pShim->pAppData,
+        pFile,
+        KSQLITE_VFS_SHIM_EVENT_OPEN,
+        flags,
+        pOutFlags ? *pOutFlags : 0,
+        0,
+        zName,
+        0,
+        rc
+    );
+
+    return rc;
+}
+
+static int ksqlite_vfs_shim_delete(sqlite3_vfs* pVfs, const char* zName, int syncDir) {
+    KsqliteVfsShim* pShim = KsqliteVfsShimOf(pVfs);
+    int rc = pShim->pReal->xDelete(pShim->pReal, zName, syncDir);
+
+    if (KsqliteVfsShimVfsWants(pShim, KSQLITE_VFS_SHIM_EVENT_DELETE)) {
+        pShim->xEvent(
+            pShim->pAppData, 0, KSQLITE_VFS_SHIM_EVENT_DELETE, syncDir, 0, 0, zName, 0, rc
+        );
+    }
+
+    return rc;
+}
+
+static int ksqlite_vfs_shim_access(sqlite3_vfs* pVfs, const char* zName, int flags, int* pResOut) {
+    KsqliteVfsShim* pShim = KsqliteVfsShimOf(pVfs);
+    int rc = pShim->pReal->xAccess(pShim->pReal, zName, flags, pResOut);
+
+    if (KsqliteVfsShimVfsWants(pShim, KSQLITE_VFS_SHIM_EVENT_ACCESS)) {
+        pShim->xEvent(
+            pShim->pAppData,
+            0,
+            KSQLITE_VFS_SHIM_EVENT_ACCESS,
+            flags,
+            KsqliteVfsShimIsOk(rc) ? *pResOut : 0,
+            0,
+            zName,
+            0,
+            rc
+        );
+    }
+
+    return rc;
+}
+
+static int ksqlite_vfs_shim_full_pathname(
+    sqlite3_vfs* pVfs,
+    const char* zName,
+    int nOut,
+    char* zOut
+) {
+    KsqliteVfsShim* pShim = KsqliteVfsShimOf(pVfs);
+    int rc = pShim->pReal->xFullPathname(pShim->pReal, zName, nOut, zOut);
+
+    if (KsqliteVfsShimVfsWants(pShim, KSQLITE_VFS_SHIM_EVENT_FULL_PATHNAME)) {
+        pShim->xEvent(
+            pShim->pAppData,
+            0,
+            KSQLITE_VFS_SHIM_EVENT_FULL_PATHNAME,
+            0,
+            0,
+            0,
+            zName,
+            KsqliteVfsShimIsOk(rc) ? zOut : 0,
+            rc
+        );
+    }
+
+    return rc;
+}
+
+// Forward-only: none of these say anything about database I/O.
+
+static void* ksqlite_vfs_shim_dl_open(sqlite3_vfs* pVfs, const char* zFilename) {
+    sqlite3_vfs* pReal = KsqliteVfsShimOf(pVfs)->pReal;
+    return pReal->xDlOpen(pReal, zFilename);
+}
+
+static void ksqlite_vfs_shim_dl_error(sqlite3_vfs* pVfs, int nByte, char* zErrMsg) {
+    sqlite3_vfs* pReal = KsqliteVfsShimOf(pVfs)->pReal;
+    pReal->xDlError(pReal, nByte, zErrMsg);
+}
+
+static void (*ksqlite_vfs_shim_dl_sym(sqlite3_vfs* pVfs, void* pHandle, const char* zSymbol))(void) {
+    sqlite3_vfs* pReal = KsqliteVfsShimOf(pVfs)->pReal;
+    return pReal->xDlSym(pReal, pHandle, zSymbol);
+}
+
+static void ksqlite_vfs_shim_dl_close(sqlite3_vfs* pVfs, void* pHandle) {
+    sqlite3_vfs* pReal = KsqliteVfsShimOf(pVfs)->pReal;
+    pReal->xDlClose(pReal, pHandle);
+}
+
+static int ksqlite_vfs_shim_randomness(sqlite3_vfs* pVfs, int nByte, char* zOut) {
+    sqlite3_vfs* pReal = KsqliteVfsShimOf(pVfs)->pReal;
+    return pReal->xRandomness(pReal, nByte, zOut);
+}
+
+static int ksqlite_vfs_shim_sleep(sqlite3_vfs* pVfs, int microseconds) {
+    sqlite3_vfs* pReal = KsqliteVfsShimOf(pVfs)->pReal;
+    return pReal->xSleep(pReal, microseconds);
+}
+
+static int ksqlite_vfs_shim_current_time(sqlite3_vfs* pVfs, double* pTimeOut) {
+    sqlite3_vfs* pReal = KsqliteVfsShimOf(pVfs)->pReal;
+    return pReal->xCurrentTime(pReal, pTimeOut);
+}
+
+static int ksqlite_vfs_shim_get_last_error(sqlite3_vfs* pVfs, int nErr, char* zErr) {
+    sqlite3_vfs* pReal = KsqliteVfsShimOf(pVfs)->pReal;
+    return pReal->xGetLastError(pReal, nErr, zErr);
+}
+
+static int ksqlite_vfs_shim_current_time_int64(sqlite3_vfs* pVfs, sqlite3_int64* pTimeOut) {
+    sqlite3_vfs* pReal = KsqliteVfsShimOf(pVfs)->pReal;
+    return pReal->xCurrentTimeInt64(pReal, pTimeOut);
+}
+
+static int ksqlite_vfs_shim_set_system_call(
+    sqlite3_vfs* pVfs,
+    const char* zName,
+    sqlite3_syscall_ptr pCall
+) {
+    sqlite3_vfs* pReal = KsqliteVfsShimOf(pVfs)->pReal;
+    return pReal->xSetSystemCall(pReal, zName, pCall);
+}
+
+static sqlite3_syscall_ptr ksqlite_vfs_shim_get_system_call(sqlite3_vfs* pVfs, const char* zName) {
+    sqlite3_vfs* pReal = KsqliteVfsShimOf(pVfs)->pReal;
+    return pReal->xGetSystemCall(pReal, zName);
+}
+
+static const char* ksqlite_vfs_shim_next_system_call(sqlite3_vfs* pVfs, const char* zName) {
+    sqlite3_vfs* pReal = KsqliteVfsShimOf(pVfs)->pReal;
+    return pReal->xNextSystemCall(pReal, zName);
+}
+
+// Public API
+
+int ksqlite_vfs_shim_register(
+    const char* zName,
+    const char* zUnderlying,
+    unsigned int listenedEvents,
+    unsigned int initialFileEvents,
+    ksqlite_xVfsShimEvent xEvent,
+    void* pAppData,
+    sqlite3_vfs** ppVfs
+) {
+    sqlite3_vfs* pReal;
+    KsqliteVfsShim* pShim;
+    char* zNameCopy;
+    size_t nName;
+    int rc;
+
+    *ppVfs = 0;
+
+    pReal = sqlite3_vfs_find(zUnderlying);
+    if (pReal == 0) {
+        return SQLITE_NOTFOUND;
+    }
+
+    nName = strlen(zName);
+    pShim = (KsqliteVfsShim*) sqlite3_malloc64(sizeof(KsqliteVfsShim) + nName + 1);
+    if (pShim == 0) {
+        return SQLITE_NOMEM;
+    }
+
+    memset(pShim, 0, sizeof(KsqliteVfsShim));
+    zNameCopy = (char*) &pShim[1];
+    memcpy(zNameCopy, zName, nName + 1);
+
+    pShim->pReal = pReal;
+    pShim->listenedEvents = listenedEvents;
+    pShim->initialFileEvents = initialFileEvents;
+    pShim->xEvent = xEvent;
+    pShim->pAppData = pAppData;
+
+    pShim->base.iVersion = pReal->iVersion;
+    pShim->base.szOsFile = KSQLITE_VFS_SHIM_FILE_HEADER_SIZE + pReal->szOsFile;
+    pShim->base.mxPathname = pReal->mxPathname;
+    pShim->base.zName = zNameCopy;
+    pShim->base.xOpen = ksqlite_vfs_shim_open;
+    pShim->base.xDelete = ksqlite_vfs_shim_delete;
+    pShim->base.xAccess = ksqlite_vfs_shim_access;
+    pShim->base.xFullPathname = ksqlite_vfs_shim_full_pathname;
+    pShim->base.xDlOpen = pReal->xDlOpen ? ksqlite_vfs_shim_dl_open : 0;
+    pShim->base.xDlError = pReal->xDlError ? ksqlite_vfs_shim_dl_error : 0;
+    pShim->base.xDlSym = pReal->xDlSym ? ksqlite_vfs_shim_dl_sym : 0;
+    pShim->base.xDlClose = pReal->xDlClose ? ksqlite_vfs_shim_dl_close : 0;
+    pShim->base.xRandomness = ksqlite_vfs_shim_randomness;
+    pShim->base.xSleep = ksqlite_vfs_shim_sleep;
+    pShim->base.xCurrentTime = ksqlite_vfs_shim_current_time;
+    pShim->base.xGetLastError = pReal->xGetLastError ? ksqlite_vfs_shim_get_last_error : 0;
+
+    if (pReal->iVersion >= 2) {
+        pShim->base.xCurrentTimeInt64 =
+            pReal->xCurrentTimeInt64 ? ksqlite_vfs_shim_current_time_int64 : 0;
+    }
+
+    if (pReal->iVersion >= 3) {
+        pShim->base.xSetSystemCall = pReal->xSetSystemCall ? ksqlite_vfs_shim_set_system_call : 0;
+        pShim->base.xGetSystemCall = pReal->xGetSystemCall ? ksqlite_vfs_shim_get_system_call : 0;
+        pShim->base.xNextSystemCall =
+            pReal->xNextSystemCall ? ksqlite_vfs_shim_next_system_call : 0;
+    }
+
+    rc = sqlite3_vfs_register(&pShim->base, 0);
+    if (rc != SQLITE_OK) {
+        sqlite3_free(pShim);
+        return rc;
+    }
+
+    *ppVfs = &pShim->base;
+    return SQLITE_OK;
+}
+
+int ksqlite_vfs_shim_unregister(sqlite3_vfs* pVfs) {
+    int rc = sqlite3_vfs_unregister(pVfs);
+
+    if (rc == SQLITE_OK) {
+        sqlite3_free(pVfs);
+    }
+
+    return rc;
+}
+
+void* ksqlite_vfs_shim_app_data(sqlite3_vfs* pVfs) {
+    return KsqliteVfsShimOf(pVfs)->pAppData;
+}
+
+void* ksqlite_vfs_shim_file_data(sqlite3_file* pFile) {
+    return KsqliteVfsShimFileOf(pFile)->pData;
+}
+
+void ksqlite_vfs_shim_file_set_data(sqlite3_file* pFile, void* pData) {
+    KsqliteVfsShimFileOf(pFile)->pData = pData;
+}
+
+unsigned int ksqlite_vfs_shim_file_events(sqlite3_file* pFile) {
+    return KsqliteVfsShimFileOf(pFile)->events;
+}
+
+void ksqlite_vfs_shim_file_set_events(sqlite3_file* pFile, unsigned int events) {
+    KsqliteVfsShimFileOf(pFile)->events = events;
+}
+
+sqlite3_file* ksqlite_vfs_shim_file_lookup(
+    sqlite3_vfs* pVfs,
+    sqlite3* db,
+    const char* zSchema,
+    int journal
+) {
+    sqlite3_file* pFile = 0;
+    int op = journal ? SQLITE_FCNTL_JOURNAL_POINTER : SQLITE_FCNTL_FILE_POINTER;
+
+    // SQLite hands back the connection's own sqlite3_file, opened or not, through whichever VFS.
+    // It's one of ours only if it's open with our own methods, and belongs to this shim.
+    if (sqlite3_file_control(db, zSchema, op, &pFile) != SQLITE_OK
+        || pFile == 0
+        || pFile->pMethods == 0
+        || pFile->pMethods->xClose != ksqlite_vfs_shim_io_close
+        || KsqliteVfsShimFileOf(pFile)->pShim != KsqliteVfsShimOf(pVfs)) {
+        return 0;
+    }
+
+    return pFile;
 }
 
 ///////////////////////////////////////////////////////////////////////////

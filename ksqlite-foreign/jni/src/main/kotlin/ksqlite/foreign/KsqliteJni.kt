@@ -34,6 +34,7 @@ import ksqlite.foreign.callbacks.ProgressHandlerCallback
 import ksqlite.foreign.callbacks.RollbackHookCallback
 import ksqlite.foreign.callbacks.TraceCallback
 import ksqlite.foreign.callbacks.UpdateHookCallback
+import ksqlite.foreign.callbacks.VfsShimCallbacks
 import ksqlite.foreign.callbacks.VtabModuleCallbacks
 import ksqlite.foreign.callbacks.WalHookCallback
 import ksqlite.foreign.structs.JniStructLayoutProvider
@@ -1079,6 +1080,57 @@ public external fun sqlite3_vfs_register(
 ): Int
 
 public external fun sqlite3_vfs_unregister(vfs: JniPointer): Int
+
+///////////////////////////////////////////////////////////////////////////
+// VFS Shim
+///////////////////////////////////////////////////////////////////////////
+
+/**
+ * Registers a VFS shim (`ksqlite_vfs_shim_register`) named [name] over [underlyingVfsName] (or the
+ * default VFS if `null`), reporting its events to [callbacks]. Returns the shim's `sqlite3_vfs`
+ * address, or `0` on failure.
+ */
+private external fun nativeVfsShimRegister(
+    name: String,
+    underlyingVfsName: String?,
+    listenedEvents: Int,
+    initialFileEvents: Int,
+    callbacks: VfsShimCallbacks
+): Long
+
+public fun vfsShimRegister(
+    name: String,
+    underlyingVfsName: String?,
+    listenedEvents: Int,
+    initialFileEvents: Int,
+    callbacks: VfsShimCallbacks
+): Long = nativeVfsShimRegister(name, underlyingVfsName, listenedEvents, initialFileEvents, callbacks)
+
+/**
+ * Unregisters the VFS shim at [vfs] (`ksqlite_vfs_shim_unregister`), releasing its callbacks on
+ * success.
+ */
+private external fun nativeVfsShimUnregister(vfs: Long): Int
+
+public fun vfsShimUnregister(vfs: Long): Int = nativeVfsShimUnregister(vfs)
+
+/**
+ * Returns the file object (from [VfsShimCallbacks.onOpen]) for [db]'s own open database file - or,
+ * with [journal], its journal/WAL file - for [schema], if it was opened through the VFS shim at
+ * [vfs]. Otherwise `null`.
+ */
+private external fun nativeVfsShimFileLookup(vfs: Long, db: Long, schema: String, journal: Boolean): Any?
+
+public fun vfsShimFileLookup(vfs: Long, db: Long, schema: String, journal: Boolean): Any? =
+    nativeVfsShimFileLookup(vfs, db, schema, journal)
+
+/**
+ * Sets the events enabled on the shim file at [filePointer] (see [VfsShimCallbacks.onOpen]).
+ */
+private external fun nativeVfsShimFileSetEvents(filePointer: Long, events: Int)
+
+public fun vfsShimFileSetEvents(filePointer: Long, events: Int): Unit =
+    nativeVfsShimFileSetEvents(filePointer, events)
 
 public external fun sqlite3_vtab_collation(
     info: JniPointer,
