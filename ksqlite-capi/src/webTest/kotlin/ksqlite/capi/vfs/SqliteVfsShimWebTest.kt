@@ -109,9 +109,9 @@ class SqliteVfsShimWebTest {
                         assertEquals(OK, sqlite3_close(db))
                     }
 
-                    val nameA = pathA.substringAfterLast('/')
+                    val nameA = fileName(pathA)
                     assertTrue(reads.isNotEmpty(), "expected reads of A")
-                    assertTrue(reads.all { it?.endsWith("/$nameA") == true }, "expected only reads of $nameA, got $reads")
+                    assertTrue(reads.all { fileName(it) == nameA }, "expected only reads of $nameA, got $reads")
                 }
             }
         } finally {
@@ -384,7 +384,7 @@ class SqliteVfsShimWebTest {
             didDelete = { filename, _, result -> events += "delete:${filename?.endsWith("-journal")}:${ok(result)}" },
             didAccess = { _, flags, _, result -> events += "access:$flags:${ok(result)}" },
             didFullPathname = { filename, fullPathname, result ->
-                val name = filename?.substringAfterLast('/')
+                val name = fileName(filename)
                 events += "fullPathname:${name != null && fullPathname?.endsWith(name) == true}:${ok(result)}"
             },
         )
@@ -511,6 +511,9 @@ class SqliteVfsShimWebTest {
             assertEquals(OK, shim.unregister())
         }
     }
+
+    /** The last component of [path], whichever separator the platform uses (`/`, or `\` on Windows). */
+    private fun fileName(path: String?): String? = path?.substringAfterLast('/')?.substringAfterLast('\\')
 
     private fun openThrough(shim: SqliteVfsShim, path: String, create: Boolean = false): sqlite3 {
         val flags = if (create) SqliteOpenFlag.READWRITE or SqliteOpenFlag.CREATE else SqliteOpenFlag.READWRITE
